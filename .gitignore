@@ -1,0 +1,21 @@
+## Ignore STM32CubeIDE temporary files and build results
+
+# User-specific files
+*.launch
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+
+# STM32CubeIDE cache/options directory
+.settings/
+
+# Visual Studio Code cache/options directory
+.vs/
+.vscode/
+
+# STM32CubeIDE cache files
+.mxproject
+
+# User notes
+Notes/
