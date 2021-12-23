@@ -229,7 +229,6 @@ void gimbal_task(void *pvParameters)
 
     //shoot initialize
     shoot_init();
-
     //keep checking whether two gimbal motors are online
  //   while (toe_is_error(YAW_GIMBAL_MOTOR_TOE) || toe_is_error(PITCH_GIMBAL_MOTOR_TOE))
  //   {

@@ -22,6 +22,7 @@
 #include "cmsis_os.h"
 #include "can.h"
 #include "dma.h"
+#include "i2c.h"
 #include "rtc.h"
 #include "spi.h"
 #include "tim.h"
@@ -109,9 +110,11 @@ int main(void)
   MX_SPI1_Init();
   MX_USART6_UART_Init();
   MX_TIM10_Init();
+  MX_I2C3_Init();
   /* USER CODE BEGIN 2 */
   can_filter_init();
   remote_control_init();
+  delay_init();
   /* USER CODE END 2 */
 
   /* Init scheduler */

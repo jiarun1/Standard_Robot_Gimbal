@@ -1,739 +1,155 @@
 /**
-  ************************(C) COPYRIGHT 2021 UNNC LANCET************************
+  ****************************(C) COPYRIGHT 2019 DJI****************************
   * @file       INS_task.c/h
-  * @brief      provide INS task and pointer request functions, based on
-  *             bsp_imu.c/h library
+  * @brief      use bmi088 to calculate the euler angle. no use ist8310, so only
+  *             enable data ready pin to save cpu time.enalbe bmi088 data ready
+  *             enable spi DMA to save the time spi transmit
   * @note
   * @history
   *  Version    Date            Author          Modification
-  *  V2.0.0     Feb-26-2021     YW              1. done
+  *  V1.0.0     Dec-26-2018     RM              1. done
+  *  V2.0.0     Nov-11-2019     RM              1. support bmi088, but don't support mpu6500
   *
   @verbatim
   ==============================================================================
 
   ==============================================================================
   @endverbatim
-  ************************(C) COPYRIGHT 2021 UNNC LANCET************************
+  ****************************(C) COPYRIGHT 2019 DJI****************************
   */
 
 #include "INS_task.h"
+#include "main.h"
 #include "cmsis_os.h"
 //#include "detect_task.h"
-#include "ist8310_reg.h"
-#include "math.h"
-#include "mpu6500_reg.h"
+
 #include "user_lib.h"
-#include "spi.h"
 #include "struct_typedef.h"
+//#include "math.h"
+
+#include "bsp_imu_pwm.h"
+#include "bsp_spi.h"
+#include "bmi088driver.h"
+#include "ist8310driver.h"
+#include "pid.h"
+#include "ahrs.h"
+
+
+//#include "spi.h"
+
+
+float32_t INS_angle[3] = {0};
+float32_t INS_gyro[3] = {0};
+
+#define IMU_temp_PWM(pwm)  imu_pwm_set(pwm)                    //pwm给定
+
+#define BMI088_BOARD_INSTALL_SPIN_MATRIX    \
+    {0.0f, 1.0f, 0.0f},                     \
+    {-1.0f, 0.0f, 0.0f},                     \
+    {0.0f, 0.0f, 1.0f}                      \
+
+#define IST8310_BOARD_INSTALL_SPIN_MATRIX   \
+    {1.0f, 0.0f, 0.0f},                     \
+    {0.0f, 1.0f, 0.0f},                     \
+    {0.0f, 0.0f, 1.0f}                      \
+
 
 extern SPI_HandleTypeDef hspi1;
 
-#define MPU_HSPI hspi1
-#define MPU_NSS_LOW HAL_GPIO_WritePin(MPU_SPI_NSS_GPIO_Port, MPU_SPI_NSS_Pin, GPIO_PIN_RESET)
-#define MPU_NSS_HIGH HAL_GPIO_WritePin(MPU_SPI_NSS_GPIO_Port, MPU_SPI_NSS_Pin, GPIO_PIN_SET)
-#define MPU_DELAY(x) osDelay(x)
 
-#define IMU_KP 2.0f                                          /*
-                                                              * proportional gain governs rate of 
-                                                              * convergence to accelerometer/magnetometer 
-															                                */
-#define IMU_KI 0.01f                                         /*
-                                                              * integral gain governs rate of 
-                                                              * convergence of gyroscope biases 
-                                                              */
+static TaskHandle_t INS_task_local_handler;
 
-static uint8_t mpu_write_byte(const uint8_t reg, const uint8_t data);
-static uint8_t mpu_read_byte(const uint8_t reg);
-static uint8_t mpu_read_bytes(const uint8_t regAddr, uint8_t* pData, uint8_t len);
-static void ist_reg_write_by_mpu(uint8_t addr, uint8_t data);
-static uint8_t ist_reg_read_by_mpu(uint8_t addr);
-static void mpu_master_i2c_auto_read_config(uint8_t device_address, uint8_t reg_base_addr, uint8_t data_num);
-static uint8_t ist8310_init(void);
-static uint8_t ist8310_get_data(uint8_t* buff);
-static void mpu_get_data(void);
-static uint8_t mpu_set_gyro_fsr(uint8_t fsr);
-static uint8_t mpu_set_accel_fsr(uint8_t fsr);
-static uint8_t mpu_device_init(void);
-static void mpu_offset_call(void);
-static void init_quaternion(void);
-static void imu_ahrs_update(void);
-static void imu_attitude_update(void);
+uint8_t gyro_dma_rx_buf[SPI_DMA_GYRO_LENGHT];
+uint8_t gyro_dma_tx_buf[SPI_DMA_GYRO_LENGHT] = {0x82,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-static volatile float32_t q0 = 1.0f;
-static volatile float32_t q1 = 0.0f;
-static volatile float32_t q2 = 0.0f;
-static volatile float32_t q3 = 0.0f;
-static volatile float32_t exInt, eyInt, ezInt;                      /* error integral */
-static volatile float32_t gx, gy, gz, ax, ay, az, mx, my, mz;
-static volatile uint32_t  last_update, now_update;                  /* Sampling cycle count, ubit ms */
-static uint8_t tx, rx;
-static uint8_t tx_buff[14] = { 0xff };
-static uint8_t mpu_buff[14];                                        /* buffer to save imu raw data */
-static uint8_t ist_buff[6];                                         /* buffer to save IST8310 raw data */
-mpu_data_t mpu_data;
-imu_t imu={0};
+uint8_t accel_dma_rx_buf[SPI_DMA_ACCEL_LENGHT];
+uint8_t accel_dma_tx_buf[SPI_DMA_ACCEL_LENGHT] = {0x92,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-//final output used in other place
-static float32_t INS_gyro[3] = {0.0f, 0.0f, 0.0f};
-static float32_t INS_angle[3] = {0.0f, 0.0f, 0.0f};      //euler angle, unit: rad
 
-/**
-  * @brief  write a byte of data to specified register
-  * @param  reg:  the address of register to be written
-  *         data: data to be written
-  * @retval 
-  * @usage  call in ist_reg_write_by_mpu(),         
-  *                 ist_reg_read_by_mpu(), 
-  *                 mpu_master_i2c_auto_read_config(), 
-  *                 ist8310_init(), 
-  *                 mpu_set_gyro_fsr(),             
-  *                 mpu_set_accel_fsr(), 
-  *                 mpu_device_init() functions
-  */
-static uint8_t mpu_write_byte(const uint8_t reg, const uint8_t data)
-{
-    MPU_NSS_LOW;
-    tx = reg & 0x7F;
-    HAL_SPI_TransmitReceive(&MPU_HSPI, &tx, &rx, 1, 55);
-    tx = data;
-    HAL_SPI_TransmitReceive(&MPU_HSPI, &tx, &rx, 1, 55);
-    MPU_NSS_HIGH;
-    return 0;
-}
+uint8_t accel_temp_dma_rx_buf[SPI_DMA_ACCEL_TEMP_LENGHT];
+uint8_t accel_temp_dma_tx_buf[SPI_DMA_ACCEL_TEMP_LENGHT] = {0xA2,0xFF,0xFF,0xFF};
+
+
+
+volatile uint8_t gyro_update_flag = 0;
+volatile uint8_t accel_update_flag = 0;
+volatile uint8_t accel_temp_update_flag = 0;
+volatile uint8_t mag_update_flag = 0;
+volatile uint8_t imu_start_dma_flag = 0;
+
+
+bmi088_real_data_t bmi088_real_data;
+float32_t gyro_scale_factor[3][3] = {BMI088_BOARD_INSTALL_SPIN_MATRIX};
+float32_t gyro_offset[3];
+float32_t gyro_cali_offset[3];
+
+float32_t accel_scale_factor[3][3] = {BMI088_BOARD_INSTALL_SPIN_MATRIX};
+float32_t accel_offset[3];
+float32_t accel_cali_offset[3];
+
+ist8310_real_data_t ist8310_real_data;
+float32_t mag_scale_factor[3][3] = {IST8310_BOARD_INSTALL_SPIN_MATRIX};
+float32_t mag_offset[3];
+float32_t mag_cali_offset[3];
+
+static uint8_t first_temperate;
+static const float32_t imu_temp_PID[3] = {TEMPERATURE_PID_KP, TEMPERATURE_PID_KI, TEMPERATURE_PID_KD};
+static pid_type_def imu_temp_pid;
+
+static const float timing_time = 0.001f;   //tast run time , unit s.任务运行的时间 单位 s
+
+
+//加速度计低通滤波
+static float32_t accel_fliter_1[3] = {0.0f, 0.0f, 0.0f};
+static float32_t accel_fliter_2[3] = {0.0f, 0.0f, 0.0f};
+static float32_t accel_fliter_3[3] = {0.0f, 0.0f, 0.0f};
+static const float32_t fliter_num[3] = {1.929454039488895f, -0.93178349823448126f, 0.002329458745586203f};
+
+
+
+
+//static float32_t INS_gyro[3] = {0.0f, 0.0f, 0.0f};
+static float32_t INS_accel[3] = {0.0f, 0.0f, 0.0f};
+static float32_t INS_mag[3] = {0.0f, 0.0f, 0.0f};
+static float32_t INS_quat[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+//float32_t INS_angle[3] = {0.0f, 0.0f, 0.0f};      //euler angle, unit rad.欧拉角 单位 rad
+
 
 /**
-  * @brief  read a byte of data from specified register
-  * @param  reg: the address of register to be read
-  * @retval 
-  * @usage  call in ist_reg_read_by_mpu(),         
-  *                 mpu_device_init() function
+  * @brief          rotate the gyro, accel and mag, and calculate the zero drift, because sensors have
+  *                 different install derection.
+  * @param[out]     gyro: after plus zero drift and rotate
+  * @param[out]     accel: after plus zero drift and rotate
+  * @param[out]     mag: after plus zero drift and rotate
+  * @param[in]      bmi088: gyro and accel data
+  * @param[in]      ist8310: mag data
+  * @retval         none
   */
-static uint8_t mpu_read_byte(const uint8_t reg)
-{
-    MPU_NSS_LOW;
-    tx = reg | 0x80;
-    HAL_SPI_TransmitReceive(&MPU_HSPI, &tx, &rx, 1, 55);
-    HAL_SPI_TransmitReceive(&MPU_HSPI, &tx, &rx, 1, 55);
-    MPU_NSS_HIGH;
-    return rx;
-}
+static void imu_cali_slove(float32_t gyro[3], float32_t accel[3], float32_t mag[3], bmi088_real_data_t *bmi088, ist8310_real_data_t *ist8310);
 
 /**
-  * @brief  read bytes of data from specified register
-  * @param  reg: address from where data is to be written
-  * @retval error code
-  * @usage  call in ist8310_get_data(),         
-  *                 mpu_get_data(), 
-  *                 mpu_offset_call() functions
+  * @brief          control the temperature of bmi088
+  * @param[in]      temp: the temperature of bmi088
+  * @retval         none
   */
-static uint8_t mpu_read_bytes(const uint8_t regAddr, uint8_t* pData, uint8_t len)
-{
-    bool_t errorcode = 0;
-    MPU_NSS_LOW;
-    tx         = regAddr | 0x80;
-    tx_buff[0] = tx;
-    errorcode = HAL_SPI_TransmitReceive(&MPU_HSPI, &tx, &rx, 1, 55);
-    errorcode = HAL_SPI_TransmitReceive(&MPU_HSPI, tx_buff, pData, len, 55);
-    MPU_NSS_HIGH;
-
-    return errorcode;
-}
+static void imu_temp_control(float32_t temp);
 
 /**
-  * @brief  write IST8310 register through MPU6500's I2C master
-  * @param  addr: the address to be written of IST8310's register
-  *         data: data to be written
-  * @retval
-  * @usage  call in ist8310_init() function
+  * @brief          open the SPI DMA accord to the value of imu_update_flag
+  * @param[in]      none
+  * @retval         none
   */
-static void ist_reg_write_by_mpu(uint8_t addr, uint8_t data)
-{
-    /* turn off slave 1 at first */
-    mpu_write_byte(MPU6500_I2C_SLV1_CTRL, 0x00);
-    MPU_DELAY(2);
-    mpu_write_byte(MPU6500_I2C_SLV1_REG, addr);
-    MPU_DELAY(2);
-    mpu_write_byte(MPU6500_I2C_SLV1_DO, data);
-    MPU_DELAY(2);
-    /* turn on slave 1 with one byte transmitting */
-    mpu_write_byte(MPU6500_I2C_SLV1_CTRL, 0x80 | 0x01);
-    /* wait longer to ensure the data is transmitted from slave 1 */
-    MPU_DELAY(10);
-}
+static void imu_cmd_spi_dma(void);
 
-/**
-  * @brief  write IST8310 register through MPU6500's I2C Master
-  * @param  addr: the address to be read of IST8310's register
-  * @retval
-  * @usage  call in ist8310_init() function
-  */
-static uint8_t ist_reg_read_by_mpu(uint8_t addr)
-{
-    uint8_t retval;
-    mpu_write_byte(MPU6500_I2C_SLV4_REG, addr);
-    MPU_DELAY(10);
-    mpu_write_byte(MPU6500_I2C_SLV4_CTRL, 0x80);
-    MPU_DELAY(10);
-    retval = mpu_read_byte(MPU6500_I2C_SLV4_DI);
-    /* turn off slave4 after read */
-    mpu_write_byte(MPU6500_I2C_SLV4_CTRL, 0x00);
-    MPU_DELAY(10);
-    return retval;
-}
-
-/**
-  * @brief    initialize the MPU6500 I2C Slave 0 for I2C reading.
-  * @param    device_address: slave device address, Address[6:0]
-  * @retval   void
-  * @note
-  */
-static void mpu_master_i2c_auto_read_config(uint8_t device_address, uint8_t reg_base_addr, uint8_t data_num)
-{
-    /* 
-	 * configure the device address of the IST8310
-     * use slave1, auto transmit single measure mode 
-	 */
-    mpu_write_byte(MPU6500_I2C_SLV1_ADDR, device_address);
-    MPU_DELAY(2);
-    mpu_write_byte(MPU6500_I2C_SLV1_REG, IST8310_R_CONFA);
-    MPU_DELAY(2);
-    mpu_write_byte(MPU6500_I2C_SLV1_DO, IST8310_ODR_MODE);
-    MPU_DELAY(2);
-
-    /* use slave0,auto read data */
-    mpu_write_byte(MPU6500_I2C_SLV0_ADDR, 0x80 | device_address);
-    MPU_DELAY(2);
-    mpu_write_byte(MPU6500_I2C_SLV0_REG, reg_base_addr);
-    MPU_DELAY(2);
-
-    /* every eight mpu6500 internal samples one i2c master read */
-    mpu_write_byte(MPU6500_I2C_SLV4_CTRL, 0x03);
-    MPU_DELAY(2);
-    /* enable slave 0 and 1 access delay */
-    mpu_write_byte(MPU6500_I2C_MST_DELAY_CTRL, 0x01 | 0x02);
-    MPU_DELAY(2);
-    /* enable slave 1 auto transmit */
-    mpu_write_byte(MPU6500_I2C_SLV1_CTRL, 0x80 | 0x01);
-	/* Wait 6ms (minimum waiting time for 16 times internal average setup) */
-    MPU_DELAY(6); 
-    /* enable slave 0 with data_num bytes reading */
-    mpu_write_byte(MPU6500_I2C_SLV0_CTRL, 0x80 | data_num);
-    MPU_DELAY(2);
-}
-
-/**
-  * @brief  Initializes the IST8310 device
-  * @param
-  * @retval
-  * @usage  call in mpu_device_init() function
-  */
-static uint8_t ist8310_init(void)
-{
-	/* enable iic master mode */
-    mpu_write_byte(MPU6500_USER_CTRL, 0x30);
-    MPU_DELAY(10);
-	/* enable iic 400khz */
-    mpu_write_byte(MPU6500_I2C_MST_CTRL, 0x0d); 
-    MPU_DELAY(10);
-
-    /* turn on slave 1 for ist write and slave 4 to ist read */
-    mpu_write_byte(MPU6500_I2C_SLV1_ADDR, IST8310_ADDRESS);  
-    MPU_DELAY(10);
-    mpu_write_byte(MPU6500_I2C_SLV4_ADDR, 0x80 | IST8310_ADDRESS);
-    MPU_DELAY(10);
-
-    /* IST8310_R_CONFB 0x01 = device rst */
-    ist_reg_write_by_mpu(IST8310_R_CONFB, 0x01);
-    MPU_DELAY(10);
-    if (IST8310_DEVICE_ID_A != ist_reg_read_by_mpu(IST8310_WHO_AM_I))
+#if (IMU_CALIBRATION == 1)
+    void INS_task(void *pvParameters)
     {
-        return 1;
+    	//TODO: add the code to get the offset data of MPU
     }
 
-	/* soft reset */
-    ist_reg_write_by_mpu(IST8310_R_CONFB, 0x01); 
-    MPU_DELAY(10);
-
-	/* config as ready mode to access register */
-    ist_reg_write_by_mpu(IST8310_R_CONFA, 0x00); 
-    if (ist_reg_read_by_mpu(IST8310_R_CONFA) != 0x00)
-    {
-        return 2;
-    }
-    MPU_DELAY(10);
-
-	/* normal state, no int */
-    ist_reg_write_by_mpu(IST8310_R_CONFB, 0x00);
-    if (ist_reg_read_by_mpu(IST8310_R_CONFB) != 0x00)
-    {
-        return 3;
-    }
-    MPU_DELAY(10);
-		
-    /* config low noise mode, x,y,z axis 16 time 1 avg */
-    ist_reg_write_by_mpu(IST8310_AVGCNTL, 0x24); //100100
-    if (ist_reg_read_by_mpu(IST8310_AVGCNTL) != 0x24)
-    {
-        return 4;
-    }
-    MPU_DELAY(10);
-
-    /* Set/Reset pulse duration setup,normal mode */
-    ist_reg_write_by_mpu(IST8310_PDCNTL, 0xc0);
-    if (ist_reg_read_by_mpu(IST8310_PDCNTL) != 0xc0)
-    {
-        return 5;
-    }
-    MPU_DELAY(10);
-
-    /* turn off slave1 & slave 4 */
-    mpu_write_byte(MPU6500_I2C_SLV1_CTRL, 0x00);
-    MPU_DELAY(10);
-    mpu_write_byte(MPU6500_I2C_SLV4_CTRL, 0x00);
-    MPU_DELAY(10);
-
-    /* configure and turn on slave 0 */
-    mpu_master_i2c_auto_read_config(IST8310_ADDRESS, IST8310_R_XL, 0x06);
-    MPU_DELAY(100);
-    return 0;
-}
-
+#else
 /**
-  * @brief  get the data of IST8310
-  * @param  buff: the buffer to save the data of IST8310
-  * @retval
-  * @usage  call in mpu_get_data() function
-  */
-static uint8_t ist8310_get_data(uint8_t* buff)
-{
-    return mpu_read_bytes(MPU6500_EXT_SENS_DATA_00, buff, 6);
-}
-
-
-/**
-  * @brief  get the data of imu
-  * @param  
-  * @retval
-  * @usage  call in INS_task() function
-  */
-static void mpu_get_data(void)
-{
-    static bool_t mpu_error_code = 0;
-    static bool_t ist8310_error_code = 0;
-
-    mpu_error_code = mpu_read_bytes(MPU6500_ACCEL_XOUT_H, mpu_buff, 14);
-    if(mpu_error_code == HAL_OK)
-    {
-        //detect_hook(BOARD_MPU6500_TOE);
-    }
-
-    mpu_data.ax   = mpu_buff[0] << 8 | mpu_buff[1];
-    mpu_data.ay   = mpu_buff[2] << 8 | mpu_buff[3];
-    mpu_data.az   = mpu_buff[4] << 8 | mpu_buff[5];
-    mpu_data.temp = mpu_buff[6] << 8 | mpu_buff[7];
-
-    mpu_data.gx = ((mpu_buff[8]  << 8 | mpu_buff[9])  - mpu_data.gx_offset);
-    mpu_data.gy = ((mpu_buff[10] << 8 | mpu_buff[11]) - mpu_data.gy_offset);
-    mpu_data.gz = ((mpu_buff[12] << 8 | mpu_buff[13]) - mpu_data.gz_offset);
-
-    ist8310_error_code = ist8310_get_data(ist_buff);
-    if(ist8310_error_code == HAL_OK)
-    {
-        //detect_hook(BOARD_IST8310_TOE);
-    }
-
-    memcpy(&mpu_data.mx, ist_buff, 6);
-
-    memcpy(&imu.ax, &mpu_data.ax, 6 * sizeof(int16_t));
-	
-    imu.temp = 21 + mpu_data.temp / 333.87f;
-	/* 2000dps -> rad/s */
-	imu.wx   = mpu_data.gx / 16.384f / 57.3f;
-    imu.wy   = mpu_data.gy / 16.384f / 57.3f; 
-    imu.wz   = mpu_data.gz / 16.384f / 57.3f;
-}
-
-
-/**
-  * @brief  set imu 6500 gyroscope measure range
-  * @param  fsr: range(0,±250dps;1,±500dps;2,±1000dps;3,±2000dps)
-  * @retval
-  * @usage  call in mpu_device_init() function
-  */
-static uint8_t mpu_set_gyro_fsr(uint8_t fsr)
-{
-  return mpu_write_byte(MPU6500_GYRO_CONFIG, fsr << 3);
-}
-
-
-/**
-  * @brief  set imu 6050/6500 accelerate measure range
-  * @param  fsr: range(0,±2g;1,±4g;2,±8g;3,±16g)
-  * @retval
-  * @usage  call in mpu_device_init() function
-  */
-static uint8_t mpu_set_accel_fsr(uint8_t fsr)
-{
-  return mpu_write_byte(MPU6500_ACCEL_CONFIG, fsr << 3); 
-}
-
-static uint8_t id;
-
-/**
-  * @brief  initialize imu mpu6500 and magnet meter ist3810
-  * @param  
-  * @retval
-  * @usage  call in INS_task() function
-  */
-static uint8_t mpu_device_init(void)
-{
-	MPU_DELAY(100);
-
-	id                               = mpu_read_byte(MPU6500_WHO_AM_I);
-	uint8_t i                        = 0;
-	uint8_t MPU6500_Init_Data[10][2] = {{ MPU6500_PWR_MGMT_1, 0x80 },     /* Reset Device */ 
-										{ MPU6500_PWR_MGMT_1, 0x03 },     /* Clock Source - Gyro-Z */
-										{ MPU6500_PWR_MGMT_2, 0x00 },     /* Enable Acc & Gyro */
-										{ MPU6500_CONFIG, 0x04 },         /* LPF 41Hz */
-										{ MPU6500_GYRO_CONFIG, 0x18 },    /* +-2000dps */
-										{ MPU6500_ACCEL_CONFIG, 0x10 },   /* +-8G */
-										{ MPU6500_ACCEL_CONFIG_2, 0x02 }, /* enable LowPassFilter  Set Acc LPF */
-										{ MPU6500_USER_CTRL, 0x20 },};    /* Enable AUX */
-	for (i = 0; i < 10; i++)
-	{
-		mpu_write_byte(MPU6500_Init_Data[i][0], MPU6500_Init_Data[i][1]);
-		MPU_DELAY(1);
-	}
-
-	mpu_set_gyro_fsr(3); 		
-	mpu_set_accel_fsr(2);
-
-	ist8310_init();
-	mpu_offset_call();
-	return 0;
-}
-
-/**
-  * @brief  get the offset data of MPU6500
-  * @param  
-  * @retval
-  * @usage  call in mpu_device_init() function
-  */
-static void mpu_offset_call(void)
-{
-	int i;
-	for (i=0; i<300;i++)
-	{
-		mpu_read_bytes(MPU6500_ACCEL_XOUT_H, mpu_buff, 14);
-
-		mpu_data.ax_offset += mpu_buff[0] << 8 | mpu_buff[1];
-		mpu_data.ay_offset += mpu_buff[2] << 8 | mpu_buff[3];
-		mpu_data.az_offset += mpu_buff[4] << 8 | mpu_buff[5];
-	
-		mpu_data.gx_offset += mpu_buff[8]  << 8 | mpu_buff[9];
-		mpu_data.gy_offset += mpu_buff[10] << 8 | mpu_buff[11];
-		mpu_data.gz_offset += mpu_buff[12] << 8 | mpu_buff[13];
-
-		MPU_DELAY(5);
-	}
-	mpu_data.ax_offset=mpu_data.ax_offset / 300;
-	mpu_data.ay_offset=mpu_data.ay_offset / 300;
-	mpu_data.az_offset=mpu_data.az_offset / 300;
-	mpu_data.gx_offset=mpu_data.gx_offset / 300;
-	mpu_data.gy_offset=mpu_data.gx_offset / 300;
-	mpu_data.gz_offset=mpu_data.gz_offset / 300;
-}
-
-
-
-/**
-  * @brief  Initialize quaternion
-  * @param  
-  * @retval
-  * @usage  call in INS_task() function
-  */
-static void init_quaternion(void)
-{
-	int16_t hx, hy;//hz;
-	
-	hx = imu.mx;
-	hy = imu.my;
-	//hz = imu.mz;
-	
-	#ifdef BOARD_DOWN
-	if (hx < 0 && hy < 0) 
-	{
-		if (fabs(hx / hy) >= 1)
-		{
-			q0 = -0.005;
-			q1 = -0.199;
-			q2 = 0.979;
-			q3 = -0.0089;
-		}
-		else
-		{
-			q0 = -0.008;
-			q1 = -0.555;
-			q2 = 0.83;
-			q3 = -0.002;
-		}
-		
-	}
-	else if (hx < 0 && hy > 0)
-	{
-		if (fabs(hx / hy)>=1)   
-		{
-			q0 = 0.005;
-			q1 = -0.199;
-			q2 = -0.978;
-			q3 = 0.012;
-		}
-		else
-		{
-			q0 = 0.005;
-			q1 = -0.553;
-			q2 = -0.83;
-			q3 = -0.0023;
-		}
-		
-	}
-	else if (hx > 0 && hy > 0)
-	{
-		if (fabs(hx / hy) >= 1)
-		{
-			q0 = 0.0012;
-			q1 = -0.978;
-			q2 = -0.199;
-			q3 = -0.005;
-		}
-		else
-		{
-			q0 = 0.0023;
-			q1 = -0.83;
-			q2 = -0.553;
-			q3 = 0.0023;
-		}
-		
-	}
-	else if (hx > 0 && hy < 0)
-	{
-		if (fabs(hx / hy) >= 1)
-		{
-			q0 = 0.0025;
-			q1 = 0.978;
-			q2 = -0.199;
-			q3 = 0.008;			
-		}
-		else
-		{
-			q0 = 0.0025;
-			q1 = 0.83;
-			q2 = -0.56;
-			q3 = 0.0045;
-		}		
-	}
-	#else
-		if (hx < 0 && hy < 0)
-	{
-		if (fabs(hx / hy) >= 1)
-		{
-			q0 = 0.195;
-			q1 = -0.015;
-			q2 = 0.0043;
-			q3 = 0.979;
-		}
-		else
-		{
-			q0 = 0.555;
-			q1 = -0.015;
-			q2 = 0.006;
-			q3 = 0.829;
-		}
-		
-	}
-	else if (hx < 0 && hy > 0)
-	{
-		if(fabs(hx / hy) >= 1)
-		{
-			q0 = -0.193;
-			q1 = -0.009;
-			q2 = -0.006;
-			q3 = 0.979;
-		}
-		else
-		{
-			q0 = -0.552;
-			q1 = -0.0048;
-			q2 = -0.0115;
-			q3 = 0.8313;
-		}
-		
-	}
-	else if (hx > 0 && hy > 0)
-	{
-		if(fabs(hx / hy) >= 1)
-		{
-			q0 = -0.9785;
-			q1 = 0.008;
-			q2 = -0.02;
-			q3 = 0.195;
-		}
-		else
-		{
-			q0 = -0.9828;
-			q1 = 0.002;
-			q2 = -0.0167;
-			q3 = 0.5557;
-		}
-		
-	}
-	else if (hx > 0 && hy < 0)
-	{
-		if(fabs(hx / hy) >= 1)
-		{
-			q0 = -0.979;
-			q1 = 0.0116;
-			q2 = -0.0167;
-			q3 = -0.195;			
-		}
-		else
-		{
-			q0 = -0.83;
-			q1 = 0.014;
-			q2 = -0.012;
-			q3 = -0.556;
-		}		
-	}
-	#endif
-}
-
-/**
-  * @brief  update imu AHRS
-  * @param  
-  * @retval
-  * @usage  call in INS_task() function
-  */
-static void imu_ahrs_update(void)
-{
-    float32_t norm;
-    float32_t hx, hy, hz, bx, bz;
-    float32_t vx, vy, vz, wx, wy, wz;
-    float32_t ex, ey, ez, halfT;
-    float32_t tempq0,tempq1,tempq2,tempq3;
-
-    float32_t q0q0 = q0*q0;
-    float32_t q0q1 = q0*q1;
-    float32_t q0q2 = q0*q2;
-    float32_t q0q3 = q0*q3;
-    float32_t q1q1 = q1*q1;
-    float32_t q1q2 = q1*q2;
-    float32_t q1q3 = q1*q3;
-    float32_t q2q2 = q2*q2;
-    float32_t q2q3 = q2*q3;
-    float32_t q3q3 = q3*q3;
-
-	gx = imu.wx;
-	gy = imu.wy;
-	gz = imu.wz;
-	ax = imu.ax;
-	ay = imu.ay;
-	az = imu.az;
-	mx = imu.mx;
-	my = imu.my;
-	mz = imu.mz;
-
-	now_update  = HAL_GetTick(); //ms
-	halfT       = ((float32_t)(now_update - last_update) / 2000.0f);
-	last_update = now_update;
-	
-	/* Fast inverse square-root */
-	norm = invSqrt(ax * ax + ay * ay + az * az);
-	ax = ax * norm;
-	ay = ay * norm;
-	az = az * norm;
-	
-	#ifdef IST8310
-		norm = invSqrt(mx * mx + my * my + mz * mz);
-		mx = mx * norm;
-		my = my * norm;
-		mz = mz * norm; 
-	#else
-		mx = 0;
-		my = 0;
-		mz = 0;		
-	#endif
-	/* compute reference direction of flux */
-	hx = 2.0f * mx * (0.5f - q2q2 - q3q3) + 2.0f * my * (q1q2 - q0q3) + 2.0f * mz * (q1q3 + q0q2);
-	hy = 2.0f * mx * (q1q2 + q0q3) + 2.0f * my * (0.5f - q1q1 - q3q3) + 2.0f * mz * (q2q3 - q0q1);
-	hz = 2.0f * mx * (q1q3 - q0q2) + 2.0f * my * (q2q3 + q0q1) + 2.0f * mz * (0.5f - q1q1 - q2q2);
-	bx = sqrt((hx * hx) + (hy * hy));
-	bz = hz; 
-	
-	/* estimated direction of gravity and flux (v and w) */
-	vx = 2.0f * (q1q3 - q0q2);
-	vy = 2.0f * (q0q1 + q2q3);
-	vz = q0q0 - q1q1 - q2q2 + q3q3;
-	wx = 2.0f * bx * (0.5f - q2q2 - q3q3) + 2.0f * bz * (q1q3 - q0q2);
-	wy = 2.0f * bx * (q1q2 - q0q3) + 2.0f * bz * (q0q1 + q2q3);
-	wz = 2.0f * bx * (q0q2 + q1q3) + 2.0f * bz * (0.5f - q1q1 - q2q2);
-	
-	/* 
-	 * error is sum of cross product between reference direction 
-	 * of fields and direction measured by sensors 
-	 */
-	ex = (ay * vz - az * vy) + (my * wz - mz * wy);
-	ey = (az * vx - ax * vz) + (mz * wx - mx * wz);
-	ez = (ax * vy - ay * vx) + (mx * wy - my * wx);
-
-	/* PI */
-	if(ex != 0.0f && ey != 0.0f && ez != 0.0f)
-	{
-		exInt = exInt + ex * IMU_KI * halfT;
-		eyInt = eyInt + ey * IMU_KI * halfT;
-		ezInt = ezInt + ez * IMU_KI * halfT;
-		
-		gx = gx + IMU_KP * ex + exInt;
-		gy = gy + IMU_KP * ey + eyInt;
-		gz = gz + IMU_KP * ez + ezInt;
-	}
-	
-	tempq0 = q0 + (-q1*gx - q2*gy - q3*gz) * halfT;
-	tempq1 = q1 + (q0*gx + q2*gz - q3*gy) * halfT;
-	tempq2 = q2 + (q0*gy - q1*gz + q3*gx) * halfT;
-	tempq3 = q3 + (q0*gz + q1*gy - q2*gx) * halfT;  
-
-	/* normalise quaternion */
-	norm = invSqrt(tempq0 * tempq0 + tempq1 * tempq1 + tempq2 * tempq2 + tempq3 * tempq3);
-	q0 = tempq0 * norm;
-	q1 = tempq1 * norm;
-	q2 = tempq2 * norm;
-	q3 = tempq3 * norm;
-}
-
-/**
-  * @brief  update imu attitude
-  * @param  
-  * @retval
-  * @usage  call in INS_task() function
-  */
-static void imu_attitude_update(void)
-{
-    //the output is in unit in radius
-    //if you need unit in degree, please multiple all these three with 57.3
-	/* yaw    -pi----pi */
-	imu.yaw = -atan2(2*q1*q2 + 2*q0*q3, -2*q2*q2 - 2*q3*q3 + 1);
-	/* pitch  -pi/2----pi/2 */
-	imu.pit = -asin(-2*q1*q3 + 2*q0*q2);
-	/* roll   -pi----pi  */	
-	imu.rol =  atan2(2*q2*q3 + 2*q0*q1, -2*q1*q1 - 2*q2*q2 + 1);
-}
-
-#if INCLUDE_uxTaskGetStackHighWaterMark
-uint32_t INS_high_water;
-#endif
-
-/**
-  * @brief          imu task, init mpu6500, ist8310, calculate the euler angle
+  * @brief          imu task, init bmi088, ist8310, calculate the euler angle
   * @param[in]      pvParameters: NULL
   * @retval         none
   */
@@ -742,35 +158,259 @@ void INS_task(void *pvParameters)
     //wait a time
     osDelay(INS_TASK_INIT_TIME);
 
-    mpu_device_init();
-    init_quaternion();
-    osDelay(100);
+    // test the IMU state, if not initlizd, do it again
+    while(BMI088_init())
+    {
+        osDelay(100);
+    }
+    while(ist8310_init())
+    {
+        osDelay(100);
+    }
+    BMI088_read(bmi088_real_data.gyro, bmi088_real_data.accel, &bmi088_real_data.temp);
+
+    //rotate and zero drift
+    imu_cali_slove(INS_gyro, INS_accel, INS_mag, &bmi088_real_data, &ist8310_real_data);
+
+    PID_init(&imu_temp_pid, PID_POSITION, imu_temp_PID, TEMPERATURE_PID_MAX_OUT, TEMPERATURE_PID_MAX_IOUT);
+    AHRS_init(INS_quat, INS_accel, INS_mag);
+
+    accel_fliter_1[0] = accel_fliter_2[0] = accel_fliter_3[0] = INS_accel[0];
+    accel_fliter_1[1] = accel_fliter_2[1] = accel_fliter_3[1] = INS_accel[1];
+    accel_fliter_1[2] = accel_fliter_2[2] = accel_fliter_3[2] = INS_accel[2];
+
+    //get the handle of task
+    INS_task_local_handler = xTaskGetHandle(pcTaskGetName(NULL));
+
+    //set spi frequency
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+
+    if (HAL_SPI_Init(&hspi1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+
+    SPI1_DMA_init((uint32_t)gyro_dma_tx_buf, (uint32_t)gyro_dma_rx_buf, SPI_DMA_GYRO_LENGHT);
+
+    imu_start_dma_flag = 1;
+
+    // imu pwm temperature
+    imu_pwm_init();
 
     while (1)
     {
-        //update value
-        mpu_get_data();
-        imu_ahrs_update();
-        imu_attitude_update();
 
-        //assign value
-        INS_angle[INS_YAW_ADDRESS_OFFSET] = imu.yaw;
-        INS_angle[INS_PITCH_ADDRESS_OFFSET] = imu.pit;
-        INS_angle[INS_ROLL_ADDRESS_OFFSET] = imu.rol;
-        INS_gyro[INS_GYRO_X_ADDRESS_OFFSET] = gx;
-        INS_gyro[INS_GYRO_Y_ADDRESS_OFFSET] = gy;
-        INS_gyro[INS_GYRO_Z_ADDRESS_OFFSET] = gz;
+        //wait spi DMA tansmit done
+        while (ulTaskNotifyTake(pdTRUE, portMAX_DELAY) != pdPASS)
+        {
+        }
 
-#if INCLUDE_uxTaskGetStackHighWaterMark
-        INS_high_water = uxTaskGetStackHighWaterMark(NULL);
+        if(gyro_update_flag & (1 << IMU_NOTIFY_SHFITS))
+        {
+            gyro_update_flag &= ~(1 << IMU_NOTIFY_SHFITS);
+            BMI088_gyro_read_over(gyro_dma_rx_buf + BMI088_GYRO_RX_BUF_DATA_OFFSET, bmi088_real_data.gyro);
+        }
+
+        if(accel_update_flag & (1 << IMU_UPDATE_SHFITS))
+        {
+            accel_update_flag &= ~(1 << IMU_UPDATE_SHFITS);
+            BMI088_accel_read_over(accel_dma_rx_buf + BMI088_ACCEL_RX_BUF_DATA_OFFSET, bmi088_real_data.accel, &bmi088_real_data.time);
+
+        }
+
+        if(accel_temp_update_flag & (1 << IMU_UPDATE_SHFITS))
+        {
+            accel_temp_update_flag &= ~(1 << IMU_UPDATE_SHFITS);
+            BMI088_temperature_read_over(accel_temp_dma_rx_buf + BMI088_ACCEL_RX_BUF_DATA_OFFSET, &bmi088_real_data.temp);
+            imu_temp_control(bmi088_real_data.temp);
+        }
+
+        //rotate and zero drift
+        imu_cali_slove(INS_gyro, INS_accel, INS_mag, &bmi088_real_data, &ist8310_real_data);
+
+        //accel low-pass filter
+        accel_fliter_1[0] = accel_fliter_2[0];
+        accel_fliter_2[0] = accel_fliter_3[0];
+
+        accel_fliter_3[0] = accel_fliter_2[0] * fliter_num[0] + accel_fliter_1[0] * fliter_num[1] + INS_accel[0] * fliter_num[2];
+
+        accel_fliter_1[1] = accel_fliter_2[1];
+        accel_fliter_2[1] = accel_fliter_3[1];
+
+        accel_fliter_3[1] = accel_fliter_2[1] * fliter_num[0] + accel_fliter_1[1] * fliter_num[1] + INS_accel[1] * fliter_num[2];
+
+        accel_fliter_1[2] = accel_fliter_2[2];
+        accel_fliter_2[2] = accel_fliter_3[2];
+
+        accel_fliter_3[2] = accel_fliter_2[2] * fliter_num[0] + accel_fliter_1[2] * fliter_num[1] + INS_accel[2] * fliter_num[2];
+
+
+        AHRS_update(INS_quat, timing_time, INS_gyro, accel_fliter_3, INS_mag);
+        get_angle(INS_quat, INS_angle + INS_YAW_ADDRESS_OFFSET, INS_angle + INS_PITCH_ADDRESS_OFFSET, INS_angle + INS_ROLL_ADDRESS_OFFSET);
+
+
+        //because no use ist8310 and save time, no use
+        if(mag_update_flag &= 1 << IMU_DR_SHFITS)
+        {
+            mag_update_flag &= ~(1<< IMU_DR_SHFITS);
+            mag_update_flag |= (1 << IMU_SPI_SHFITS);
+//            ist8310_read_mag(ist8310_real_data.mag);
+        }
+    }
+}
 #endif
+
+
+
+/**
+  * @brief          rotate the gyro, accel and mag, and calculate the zero drift, because sensors have
+  *                 different install derection.
+  * @param[out]     gyro: after plus zero drift and rotate
+  * @param[out]     accel: after plus zero drift and rotate
+  * @param[out]     mag: after plus zero drift and rotate
+  * @param[in]      bmi088: gyro and accel data
+  * @param[in]      ist8310: mag data
+  * @retval         none
+  */
+static void imu_cali_slove(float32_t gyro[3], float32_t accel[3], float32_t mag[3], bmi088_real_data_t *bmi088, ist8310_real_data_t *ist8310)
+{
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        gyro[i] = bmi088->gyro[0] * gyro_scale_factor[i][0] + bmi088->gyro[1] * gyro_scale_factor[i][1] + bmi088->gyro[2] * gyro_scale_factor[i][2] + gyro_offset[i];
+        accel[i] = bmi088->accel[0] * accel_scale_factor[i][0] + bmi088->accel[1] * accel_scale_factor[i][1] + bmi088->accel[2] * accel_scale_factor[i][2] + accel_offset[i];
+        mag[i] = ist8310->mag[0] * mag_scale_factor[i][0] + ist8310->mag[1] * mag_scale_factor[i][1] + ist8310->mag[2] * mag_scale_factor[i][2] + mag_offset[i];
     }
 }
 
 /**
-  * @brief          get the euler angle, 0:yaw, 1:pitch, 2:roll, unit: rad
+  * @brief          control the temperature of bmi088
+  * @param[in]      temp: the temperature of bmi088
+  * @retval         none
+  */
+static void imu_temp_control(float32_t temp)
+{
+    uint16_t tempPWM;
+    static uint8_t temp_constant_time = 0;
+    if (first_temperate)
+    {
+        PID_calc(&imu_temp_pid, temp, TEMPERATURE_SET);
+        if (imu_temp_pid.out < 0.0f)
+        {
+            imu_temp_pid.out = 0.0f;
+        }
+        tempPWM = (uint16_t)imu_temp_pid.out;
+        IMU_temp_PWM(tempPWM);
+    }
+    else
+    {
+        //in beginning (before reach the temperature), max power
+        if (temp > TEMPERATURE_SET)
+        {
+            temp_constant_time++;
+            if (temp_constant_time > 200)
+            {
+                //达到设置温度，将积分项设置为一半最大功率，加速收敛
+                //
+                first_temperate = 1;
+                imu_temp_pid.Iout = MPU6500_TEMP_PWM_MAX / 2.0f;
+            }
+        }
+        IMU_temp_PWM(MPU6500_TEMP_PWM_MAX - 1);
+    }
+}
+
+/**
+  * @brief          calculate gyro zero drift
+  * @param[out]     gyro_offset:zero drift
+  * @param[in]      gyro:gyro data
+  * @param[out]     offset_time_count: +1 auto
+  * @retval         none
+  */
+void gyro_offset_calc(float32_t gyro_offset[3], float32_t gyro[3], uint16_t *offset_time_count)
+{
+    if (gyro_offset == NULL || gyro == NULL || offset_time_count == NULL)
+    {
+        return;
+    }
+
+        gyro_offset[0] = gyro_offset[0] - 0.0003f * gyro[0];
+        gyro_offset[1] = gyro_offset[1] - 0.0003f * gyro[1];
+        gyro_offset[2] = gyro_offset[2] - 0.0003f * gyro[2];
+        (*offset_time_count)++;
+}
+
+/**
+  * @brief          calculate gyro zero drift
+  * @param[out]     cali_scale:scale, default 1.0
+  * @param[out]     cali_offset:zero drift, collect the gyro ouput when in still
+  * @param[out]     time_count: time, when call gyro_offset_calc
+  * @retval         none
+  */
+void INS_cali_gyro(float32_t cali_scale[3], float32_t cali_offset[3], uint16_t *time_count)
+{
+        if( *time_count == 0)
+        {
+            gyro_offset[0] = gyro_cali_offset[0];
+            gyro_offset[1] = gyro_cali_offset[1];
+            gyro_offset[2] = gyro_cali_offset[2];
+        }
+        gyro_offset_calc(gyro_offset, INS_gyro, time_count);
+
+        cali_offset[0] = gyro_offset[0];
+        cali_offset[1] = gyro_offset[1];
+        cali_offset[2] = gyro_offset[2];
+        cali_scale[0] = 1.0f;
+        cali_scale[1] = 1.0f;
+        cali_scale[2] = 1.0f;
+
+}
+
+/**
+  * @brief          get gyro zero drift from flash
+  * @param[in]      cali_scale:scale, default 1.0
+  * @param[in]      cali_offset:zero drift,
+  * @retval         none
+  */
+/**
+  * @brief          校准陀螺仪设置，将从flash或者其他地方传入校准值
+  * @param[in]      陀螺仪的比例因子，1.0f为默认值，不修改
+  * @param[in]      陀螺仪的零漂
+  * @retval         none
+  */
+void INS_set_cali_gyro(float32_t cali_scale[3], float32_t cali_offset[3])
+{
+    gyro_cali_offset[0] = cali_offset[0];
+    gyro_cali_offset[1] = cali_offset[1];
+    gyro_cali_offset[2] = cali_offset[2];
+    gyro_offset[0] = gyro_cali_offset[0];
+    gyro_offset[1] = gyro_cali_offset[1];
+    gyro_offset[2] = gyro_cali_offset[2];
+}
+
+/**
+  * @brief          get the quat
   * @param[in]      none
-  * @retval         the pointer of INS_angle
+  * @retval         the point of INS_quat
+  */
+/**
+  * @brief          获取四元数
+  * @param[in]      none
+  * @retval         INS_quat的指针
+  */
+const float32_t *get_INS_quat_point(void)
+{
+    return INS_quat;
+}
+/**
+  * @brief          get the euler angle, 0:yaw, 1:pitch, 2:roll unit rad
+  * @param[in]      none
+  * @retval         the point of INS_angle
+  */
+/**
+  * @brief          获取欧拉角, 0:yaw, 1:pitch, 2:roll 单位 rad
+  * @param[in]      none
+  * @retval         INS_angle的指针
   */
 const float32_t *get_INS_angle_point(void)
 {
@@ -778,12 +418,195 @@ const float32_t *get_INS_angle_point(void)
 }
 
 /**
-  * @brief          get the rotation speed, 0:x-axis, 1:y-axis, 2:roll-axis, unit: rad/s
+  * @brief          get the rotation speed, 0:x-axis, 1:y-axis, 2:roll-axis,unit rad/s
   * @param[in]      none
-  * @retval         the pointer of INS_gyro
+  * @retval         the point of INS_gyro
   */
-const float32_t *get_gyro_data_point(void)
+/**
+  * @brief          获取角速度,0:x轴, 1:y轴, 2:roll轴 单位 rad/s
+  * @param[in]      none
+  * @retval         INS_gyro的指针
+  */
+extern const float32_t *get_gyro_data_point(void)
 {
     return INS_gyro;
+}
+/**
+  * @brief          get aceel, 0:x-axis, 1:y-axis, 2:roll-axis unit m/s2
+  * @param[in]      none
+  * @retval         the point of INS_accel
+  */
+/**
+  * @brief          获取加速度,0:x轴, 1:y轴, 2:roll轴 单位 m/s2
+  * @param[in]      none
+  * @retval         INS_accel的指针
+  */
+extern const float32_t *get_accel_data_point(void)
+{
+    return INS_accel;
+}
+/**
+  * @brief          get mag, 0:x-axis, 1:y-axis, 2:roll-axis unit ut
+  * @param[in]      none
+  * @retval         the point of INS_mag
+  */
+/**
+  * @brief          获取加速度,0:x轴, 1:y轴, 2:roll轴 单位 ut
+  * @param[in]      none
+  * @retval         INS_mag的指针
+  */
+extern const float32_t *get_mag_data_point(void)
+{
+    return INS_mag;
+}
+
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if(GPIO_Pin == INT1_ACCEL_Pin)
+    {
+        //detect_hook(BOARD_ACCEL_TOE);
+        accel_update_flag |= 1 << IMU_DR_SHFITS;
+        accel_temp_update_flag |= 1 << IMU_DR_SHFITS;
+        if(imu_start_dma_flag)
+        {
+            imu_cmd_spi_dma();
+        }
+    }
+    else if(GPIO_Pin == INT1_GYRO_Pin)
+    {
+        //detect_hook(BOARD_GYRO_TOE);
+        gyro_update_flag |= 1 << IMU_DR_SHFITS;
+        if(imu_start_dma_flag)
+        {
+            imu_cmd_spi_dma();
+        }
+    }
+    else if(GPIO_Pin == DRDY_IST8310_Pin)
+    {
+        //detect_hook(BOARD_MAG_TOE);
+        mag_update_flag |= 1 << IMU_DR_SHFITS;
+    }
+    else if(GPIO_Pin == GPIO_PIN_0)
+    {
+
+        //wake up the task
+        //唤醒任务
+        if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
+        {
+            static BaseType_t xHigherPriorityTaskWoken;
+            vTaskNotifyGiveFromISR(INS_task_local_handler, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+
+    }
+
+
+}
+
+/**
+  * @brief          open the SPI DMA accord to the value of imu_update_flag
+  * @param[in]      none
+  * @retval         none
+  */
+/**
+  * @brief          根据imu_update_flag的值开启SPI DMA
+  * @param[in]      temp:bmi088的温度
+  * @retval         none
+  */
+static void imu_cmd_spi_dma(void)
+{
+    UBaseType_t uxSavedInterruptStatus;
+    uxSavedInterruptStatus = taskENTER_CRITICAL_FROM_ISR();
+
+    //开启陀螺仪的DMA传输
+    if( (gyro_update_flag & (1 << IMU_DR_SHFITS) ) && !(hspi1.hdmatx->Instance->CR & DMA_SxCR_EN) && !(hspi1.hdmarx->Instance->CR & DMA_SxCR_EN)
+    && !(accel_update_flag & (1 << IMU_SPI_SHFITS)) && !(accel_temp_update_flag & (1 << IMU_SPI_SHFITS)))
+    {
+        gyro_update_flag &= ~(1 << IMU_DR_SHFITS);
+        gyro_update_flag |= (1 << IMU_SPI_SHFITS);
+
+        HAL_GPIO_WritePin(CS1_GYRO_GPIO_Port, CS1_GYRO_Pin, GPIO_PIN_RESET);
+        SPI1_DMA_enable((uint32_t)gyro_dma_tx_buf, (uint32_t)gyro_dma_rx_buf, SPI_DMA_GYRO_LENGHT);
+        taskEXIT_CRITICAL_FROM_ISR(uxSavedInterruptStatus);
+        return;
+    }
+    //开启加速度计的DMA传输
+    if((accel_update_flag & (1 << IMU_DR_SHFITS)) && !(hspi1.hdmatx->Instance->CR & DMA_SxCR_EN) && !(hspi1.hdmarx->Instance->CR & DMA_SxCR_EN)
+    && !(gyro_update_flag & (1 << IMU_SPI_SHFITS)) && !(accel_temp_update_flag & (1 << IMU_SPI_SHFITS)))
+    {
+        accel_update_flag &= ~(1 << IMU_DR_SHFITS);
+        accel_update_flag |= (1 << IMU_SPI_SHFITS);
+
+        HAL_GPIO_WritePin(CS1_ACCEL_GPIO_Port, CS1_ACCEL_Pin, GPIO_PIN_RESET);
+        SPI1_DMA_enable((uint32_t)accel_dma_tx_buf, (uint32_t)accel_dma_rx_buf, SPI_DMA_ACCEL_LENGHT);
+        taskEXIT_CRITICAL_FROM_ISR(uxSavedInterruptStatus);
+        return;
+    }
+
+
+
+
+    if((accel_temp_update_flag & (1 << IMU_DR_SHFITS)) && !(hspi1.hdmatx->Instance->CR & DMA_SxCR_EN) && !(hspi1.hdmarx->Instance->CR & DMA_SxCR_EN)
+    && !(gyro_update_flag & (1 << IMU_SPI_SHFITS)) && !(accel_update_flag & (1 << IMU_SPI_SHFITS)))
+    {
+        accel_temp_update_flag &= ~(1 << IMU_DR_SHFITS);
+        accel_temp_update_flag |= (1 << IMU_SPI_SHFITS);
+
+        HAL_GPIO_WritePin(CS1_ACCEL_GPIO_Port, CS1_ACCEL_Pin, GPIO_PIN_RESET);
+        SPI1_DMA_enable((uint32_t)accel_temp_dma_tx_buf, (uint32_t)accel_temp_dma_rx_buf, SPI_DMA_ACCEL_TEMP_LENGHT);
+        taskEXIT_CRITICAL_FROM_ISR(uxSavedInterruptStatus);
+        return;
+    }
+    taskEXIT_CRITICAL_FROM_ISR(uxSavedInterruptStatus);
+}
+
+
+void DMA2_Stream2_IRQHandler(void)
+{
+
+    if(__HAL_DMA_GET_FLAG(hspi1.hdmarx, __HAL_DMA_GET_TC_FLAG_INDEX(hspi1.hdmarx)) != RESET)
+    {
+        __HAL_DMA_CLEAR_FLAG(hspi1.hdmarx, __HAL_DMA_GET_TC_FLAG_INDEX(hspi1.hdmarx));
+
+        //gyro read over
+        //陀螺仪读取完毕
+        if(gyro_update_flag & (1 << IMU_SPI_SHFITS))
+        {
+            gyro_update_flag &= ~(1 << IMU_SPI_SHFITS);
+            gyro_update_flag |= (1 << IMU_UPDATE_SHFITS);
+
+            HAL_GPIO_WritePin(CS1_GYRO_GPIO_Port, CS1_GYRO_Pin, GPIO_PIN_SET);
+
+        }
+
+        //accel read over
+        //加速度计读取完毕
+        if(accel_update_flag & (1 << IMU_SPI_SHFITS))
+        {
+            accel_update_flag &= ~(1 << IMU_SPI_SHFITS);
+            accel_update_flag |= (1 << IMU_UPDATE_SHFITS);
+
+            HAL_GPIO_WritePin(CS1_ACCEL_GPIO_Port, CS1_ACCEL_Pin, GPIO_PIN_SET);
+        }
+        //temperature read over
+        //温度读取完毕
+        if(accel_temp_update_flag & (1 << IMU_SPI_SHFITS))
+        {
+            accel_temp_update_flag &= ~(1 << IMU_SPI_SHFITS);
+            accel_temp_update_flag |= (1 << IMU_UPDATE_SHFITS);
+
+            HAL_GPIO_WritePin(CS1_ACCEL_GPIO_Port, CS1_ACCEL_Pin, GPIO_PIN_SET);
+        }
+
+        imu_cmd_spi_dma();
+
+        if(gyro_update_flag & (1 << IMU_UPDATE_SHFITS))
+        {
+            gyro_update_flag &= ~(1 << IMU_UPDATE_SHFITS);
+            gyro_update_flag |= (1 << IMU_NOTIFY_SHFITS);
+            __HAL_GPIO_EXTI_GENERATE_SWIT(GPIO_PIN_0);
+        }
+    }
 }
 

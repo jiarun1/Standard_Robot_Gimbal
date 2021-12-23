@@ -230,7 +230,7 @@ void gimbal_behaviour_mode_set(gimbal_control_t *gimbal_mode_set)
     {
         gimbal_mode_set->gimbal_yaw_motor.gimbal_motor_mode = GIMBAL_MOTOR_ENCONDE;
         gimbal_mode_set->gimbal_pitch_motor.gimbal_motor_mode = GIMBAL_MOTOR_ENCONDE;
-                }
+    }
 
 }
 
@@ -535,7 +535,9 @@ static void gimbal_relative_angle_control(float32_t *yaw, float32_t *pitch, gimb
     rc_deadband_limit(gimbal_control_set->gimbal_rc_ctrl->rc.ch[PITCH_CHANNEL], pitch_channel, RC_DEADBAND);
 
     if(gimbal_control_set->gimbal_rc_ctrl->key.v&KEY_PRESSED_OFFSET_SHIFT)
-    {*yaw = yaw_channel * YAW_RC_SEN - gimbal_control_set->gimbal_rc_ctrl->mouse.x * YAW_MOUSE_SEN ;}
+    {
+    	*yaw = yaw_channel * YAW_RC_SEN - gimbal_control_set->gimbal_rc_ctrl->mouse.x * YAW_MOUSE_SEN ;
+    }
     else
     {
     	*yaw = yaw_channel * YAW_RC_SEN;
@@ -572,15 +574,16 @@ static void gimbal_AI_control(float32_t *yaw, float32_t *pitch, gimbal_control_t
     static int16_t yaw_channel = 0, pitch_channel = 0;
 
     //dead zone limit
-
+    rc_deadband_limit(AI_X,yaw_channel,1);
+    rc_deadband_limit(AI_Y,pitch_channel,1);
 
     rc_deadband_limit( frame.data.demoCmd.dx, yaw_channel, 1);
     rc_deadband_limit( frame.data.demoCmd.dy, pitch_channel, 1);
     // AI_robotic_calculation(&	 frame.data.demoCmd.dy);
     //AI_robotic_calculation(&frame.data.demoCmd.dx);
 
-    watch[0]= AI_X;
-    watch[0]= AI_X;
+    //watch[0]= AI_X;
+    //watch[1]= AI_Y;
 
    // *yaw   =  -frame.data.demoCmd.dx * YAW_AI_SEN;
    // *pitch =  frame.data.demoCmd.dy * PITCH_AI_SEN;

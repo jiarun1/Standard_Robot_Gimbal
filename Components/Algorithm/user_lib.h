@@ -20,7 +20,7 @@ typedef struct
 } __packed first_order_filter_type_t;
 
 //fast square root
-extern float32_t invSqrt(float32_t num);
+float32_t invSqrt(float32_t num);
 
 //ramp function initialization
 void ramp_init(ramp_function_source_t *ramp_source_type, float32_t frame_period, float32_t max, float32_t min);

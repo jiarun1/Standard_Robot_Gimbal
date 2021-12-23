@@ -44,13 +44,13 @@ extern CAN_HandleTypeDef hcan2;
   * motor_chassis[1]: chassis motor2 3508
   * motor_chassis[2]: chassis motor3 3508
   * motor_chassis[3]: chassis motor4 3508
-  * motor_chassis[4]: yaw gimbal motor 6020
+  * motor_chassis[4]: trigger gimbal motor 2006
   * motor_chassis[5]: pitch gimbal motor 6020
-  * motor_chassis[6]: push bullet motor 2006
+  * motor_chassis[6]: yaw gimbal motor 6020
   * motor_chassis[7]: friction motor1 3508
   * motor_chassis[8]: friction motor2 3508
   */
-static motor_measure_t motor_chassis[9];
+static motor_measure_t motor_chassis[9];// XXX: The motor ID is different from the standard robot
 
 static CAN_TxHeaderTypeDef  gimbal_tx_message;
 static uint8_t              gimbal_can_send_data[8];
@@ -88,7 +88,6 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
           get_motor_measure(&motor_chassis[i], rx_data);  //获得相应电机的encoder值 转速值rpm 电流值 电机温度
           break;
         }
-
         default:
         {
           break;
@@ -123,9 +122,9 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 
 /**
   * @brief          send control current of motor (0x205, 0x206, 0x207, 0x208)
-  * @param[in]      yaw: (0x205) 6020 motor control current, range [-30000,30000] 
+  * @param[in]      yaw: (0x207) 6020 motor control current, range [-30000,30000]
   * @param[in]      pitch: (0x206) 6020 motor control current, range [-30000,30000]
-  * @param[in]      shoot: (0x207) 2006 motor control current, range [-10000,10000]
+  * @param[in]      shoot: (0x205) 2006 motor control current, range [-10000,10000]
   * @param[in]      rev: (0x208) reserve motor control current, useless currently
   * @retval         none
   */
@@ -137,14 +136,16 @@ void CAN_cmd_gimbal(int16_t yaw, int16_t pitch, int16_t shoot, int16_t rev)
     gimbal_tx_message.IDE = CAN_ID_STD;
     gimbal_tx_message.RTR = CAN_RTR_DATA;
     gimbal_tx_message.DLC = 0x08;
-    gimbal_can_send_data[0] = (yaw >> 8);
-    gimbal_can_send_data[1] = yaw;
+
+    gimbal_can_send_data[0] = (shoot >> 8);
+    gimbal_can_send_data[1] = shoot;
     gimbal_can_send_data[2] = (pitch >> 8);
     gimbal_can_send_data[3] = pitch;
-    gimbal_can_send_data[4] = (shoot >> 8);
-    gimbal_can_send_data[5] = shoot;
+    gimbal_can_send_data[4] = (yaw >> 8);
+    gimbal_can_send_data[5] = yaw;
     gimbal_can_send_data[6] = (rev >> 8);
     gimbal_can_send_data[7] = rev;
+
     HAL_CAN_AddTxMessage(&GIMBAL_CAN, &gimbal_tx_message, gimbal_can_send_data, &send_mail_box);
 }
 
@@ -210,7 +211,7 @@ void CAN_cmd_chassis(int16_t motor1, int16_t motor2, int16_t motor3, int16_t mot
 void CAN_cmd_shoot(int16_t fri1, int16_t fri2)
 {
 	uint32_t send_mail_box;
-	shoot_tx_message.StdId = CAN_CHASSIS_ALL_ID;
+	shoot_tx_message.StdId = CAN_SHOOT_ALL_ID;
 	shoot_tx_message.IDE = CAN_ID_STD;
 	shoot_tx_message.RTR = CAN_RTR_DATA;
 	shoot_tx_message.DLC = 0x08;
@@ -232,7 +233,7 @@ void CAN_cmd_shoot(int16_t fri1, int16_t fri2)
   */
 const motor_measure_t *get_yaw_gimbal_motor_measure_point(void)
 {
-    return &motor_chassis[4];
+    return &motor_chassis[6];
 }
 
 /**
@@ -253,7 +254,7 @@ const motor_measure_t *get_pitch_gimbal_motor_measure_point(void)
   */
 const motor_measure_t *get_trigger_motor_measure_point(void)
 {
-    return &motor_chassis[6];
+    return &motor_chassis[4];
 }
 
 /**
